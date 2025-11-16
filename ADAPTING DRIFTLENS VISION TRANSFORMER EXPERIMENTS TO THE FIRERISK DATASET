@@ -1,0 +1,646 @@
+STEP-BY-STEP GUIDE: ADAPTING DRIFTLENS VISION TRANSFORMER EXPERIMENTS TO
+THE FIRERISK DATASET
+
+  ------------------------------------------------------------
+  1. SETUP REPOSITORIES AND ENVIRONMENT
+  ------------------------------------------------------------
+  Step 1.1 – Clone repos
+  git clone https://github.com/grecosalvatore/drift-lens.git
+  git clone https://github.com/CharmonyShen/FireRisk.git
+
+
+  Step 1.2 – Create env and install requirements 
+  From the `drift-lens` root: 
+  conda create -n driftlens_firerisk python=3.10 -y
+  conda activate driftlens_firerisk
+
+  pip install -r requirements.txt
+  pip install torch torchvision timm
+  # optional: jupyterlab, if the experiments are notebooks
+  pip install jupyterlab
+
+  DriftLens itself is already installable via pip install driftlens but the repo likely uses the local package; having both is fine.
+
+  Step 1.3 – Download FireRisk images
+
+  From the FireRisk README, the dataset is on Google Drive. Download the FireRisk archive and extract it somewhere like:
+
+  mkdir -p data/FireRisk
+  # manually put all PNG images under data/FireRisk/images
+
+  FireRisk consists of 91,872 labeled 270×270 RGB images, with 7 fire-risk classes, encoded as grid_code ∈ {1,…,7} in the filename.
+  https://github.com/CharmonyShen/FireRisk
+
+
+  ------------------------------------------------------------
+  2. BUILD FIRERISK PYTORCH DATASET + DATALOADERS
+  ------------------------------------------------------------
+
+  DriftLens experiments expect something STL-10-like: PyTorch dataloaders feeding images + labels into a backbone to produce embeddings.
+
+  Step 2.1 – Make a CSV (or just glob)
+
+  FireRisk filenames look like:
+  (pointid)_(grid_code)_(x_coord)_(y_coord).png
+
+  You can either:
+    - Create a CSV that lists path, label, or
+    - Parse labels on the fly from filenames.
+
+  Let’s do on-the-fly parsing.
+
+  Step 2.2 – Define a FireRisk Dataset
+
+  Create a file `experiments/firerisk_dataset.py` (or somewhere similar) in the `drift-lens` repo:
+
+  """
+
+  import os, glob
+  from PIL import Image
+  from torch.utils.data import Dataset
+  from torchvision import transforms
+
+  class FireRiskDataset(Dataset):
+      def __init__(self, root, split="train", transform=None, classes_subset=None):
+          self.root = root
+          self.transform = transform
+          pattern = os.path.join(root, "images", "*.png")
+          all_paths = sorted(glob.glob(pattern))
+
+          # parse label from filename: pointid_gridcode_x_y.png
+          paths, labels = [], []
+          for p in all_paths:
+              fname = os.path.basename(p)
+              grid_code = int(fname.split("_")[1])  # 1..7
+              if classes_subset is not None and grid_code not in classes_subset:
+                  continue
+              paths.append(p)
+              labels.append(grid_code - 1)  # make labels 0..6
+
+          # simple random split (e.g. 70/15/15) – tune as needed
+          n = len(paths)
+          idx = list(range(n))
+          # you might want to use a fixed RNG for reproducibility
+          from sklearn.model_selection import train_test_split
+          train_idx, temp_idx = train_test_split(idx, test_size=0.3, stratify=labels, random_state=42)
+          val_idx, test_idx = train_test_split(temp_idx, test_size=0.5,
+                                               stratify=[labels[i] for i in temp_idx],
+                                               random_state=42)
+          if split == "train": use_idx = train_idx
+          elif split == "val": use_idx = val_idx
+          elif split == "test": use_idx = test_idx
+          else: raise ValueError
+
+          self.paths = [paths[i] for i in use_idx]
+          self.labels = [labels[i] for i in use_idx]
+
+      def __len__(self): return len(self.paths)
+
+      def __getitem__(self, i):
+          img = Image.open(self.paths[i]).convert("RGB")
+          if self.transform: img = self.transform(img)
+          return img, self.labels[i]
+
+  """
+
+  Step 2.3 – Transforms and dataloaders
+
+  ViT-B/16 usually expects 224×224 ImageNet-normalized images. Let’s define transforms and dataloaders:
+
+  """
+
+  from torchvision import transforms
+  from torch.utils.data import DataLoader
+
+  img_transform = transforms.Compose([
+      transforms.Resize(224),
+      transforms.CenterCrop(224),
+      transforms.ToTensor(),
+      transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                           std=[0.229, 0.224, 0.225]),
+  ])
+
+  batch_size = 64
+
+  train_ds = FireRiskDataset("data/FireRisk", split="train", transform=img_transform)
+  val_ds   = FireRiskDataset("data/FireRisk", split="val",   transform=img_transform)
+  test_ds  = FireRiskDataset("data/FireRisk", split="test",  transform=img_transform)
+
+  train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4)
+  val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=4)
+  test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, num_workers=4)
+
+
+  """
+
+ You’ll reuse these loaders in both drift experiments, sometimes with classes_subset and sometimes with extra transforms (Gaussian blur).
+
+
+  ------------------------------------------------------------
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+  ------------------------------------------------------------
+
+  EXTRA NOTES:
+
+  FireRisk filenames follow: (pointid)(grid_code)(x_coord)_(y_coord).png
+  Labels are grid_code ∈ {1…7}. Convert to 0…6.
+
+  Create FireRiskDataset class to parse filenames, split train/val/test,
+  and apply transforms.
+
+  Use ImageNet normalization + ViT 224×224 transforms.
+
+  Create dataloaders: train_loader, val_loader, test_loader
+
+  ------------------------------------------------------------
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+  ------------------------------------------------------------
+
+
+  ------------------------------------------------------------
+  3. VIT CLASSIFIER AND EMBEDDING EXTRACTION 
+  ------------------------------------------------------------
+
+  You just need: (embeddings, predicted labels) for each sample in each split. 
+  The backbone choice can mirror FireRisk's paper (ViT-B/16 pre-trained on ImageNet1k)
+
+
+  3.1 Build/fine-tune ViT
+
+  Use `timm`: 
+
+
+  """
+  import timm, torch
+  import torch.nn as nn
+
+  num_classes = 7
+
+  model = timm.create_model("vit_base_patch16_224", pretrained=True)
+  model.head = nn.Linear(model.head.in_features, num_classes)
+
+  device = "cuda"
+  model.to(device)
+
+  criterion = nn.CrossEntropyLoss()
+  optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.05)
+  """
+
+  Train as they do for STL-10 (epochs, scheduler, etc.). Their STL-10 ViT F1 is ~0.9–0.96, but you don’t strictly need to match that; you just want a competent classifier.
+
+  3.2 Function to collect embeddings + predictions 
+
+  You need the encoder's representation (CLS token) and the predicted labels. With timm ViT, that's `model.forward_features`:
+
+
+  """
+  import numpy as np
+
+  def get_embeddings_and_preds(model, loader):
+      model.eval()
+      all_E, all_Y_hat, all_Y_true = [], [], []
+      with torch.no_grad():
+          for x, y in loader:
+              x = x.to(device)
+              feats = model.forward_features(x)      # [B, D]
+              logits = model.head(feats)            # [B, num_classes]
+              preds = logits.argmax(dim=1)          # [B]
+              all_E.append(feats.cpu())
+              all_Y_hat.append(preds.cpu())
+              all_Y_true.append(y)
+      E = torch.cat(all_E, dim=0).numpy()
+      Y_hat = torch.cat(all_Y_hat, dim=0).numpy()
+      Y_true = torch.cat(all_Y_true, dim=0).numpy()
+      return E, Y_hat, Y_true
+  """
+  Call this on train/val/test (and later on the drift stream windows).
+
+
+  ------------------------------------------------------------
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+  ------------------------------------------------------------
+
+  EXTRA NOTES:
+
+  TRAIN/FINE-TUNE A VISION TRANSFORMER AND EXTRACT
+  EMBEDDINGS
+  ------------------------------------------------------------
+  1. Create ViT-B/16 from timm: model =
+  timm.create_model(“vit_base_patch16_224”, pretrained=True)
+  model.head = nn.Linear(model.head.in_features, num_classes)
+
+  2. Train model on FireRisk loaders.
+
+  3. Extract embeddings: Use model.forward_features to get
+  CLS-token embedding. Store: - E = embeddings - Y_pred =
+  predicted labels - Y_true = true labels
+  ------------------------------------------------------------
+  ------------------------------------------------------------
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+  ------------------------------------------------------------
+
+
+
+
+
+
+  ------------------------------------------------------------
+  4. HOOKING THIS INTO DRIFTLENS 
+  ------------------------------------------------------------
+
+  The DrifLens API in the README is: 
+
+  """
+  from driftlens.driftlens import DriftLens
+
+  dl = DriftLens()
+  baseline = dl.estimate_baseline(E=E_train,
+                                  Y=Y_pred_train,
+                                  label_list=training_label_list,
+                                  batch_n_pc=batch_n_pc,
+                                  per_label_n_pc=per_label_n_pc)
+
+  per_batch_sorted, per_label_sorted = dl.random_sampling_threshold_estimation(
+      label_list=training_label_list,
+      E=E_threshold,
+      Y=Y_pred_threshold,
+      batch_n_pc=batch_n_pc,
+      per_label_n_pc=per_label_n_pc,
+      window_size=window_size,
+      n_samples=n_samples,
+      flag_shuffle=True,
+      flag_replacement=True,
+  )
+
+  ""
+
+  ...and then for each incoming window: 
+
+  """
+  dist = dl.compute_window_distribution_distances(E_window, Y_pred_window)
+
+  """
+
+  Your goal is to compute:
+  - `E_train, Y_pred_train` from FireRisk train set
+  - `E_threshold, Y_pred_threshold` from a “threshold” set (typically a subset of test/val under no-drift conditions)
+  - For the online stream: a sequence of windows, each with embeddings `E_window` and predicted labels `Y_pred_window`.
+
+
+  Step 4.1 - Baseline + threshold on FireRisk 
+
+  Pick:
+  - `training_label_list = list(range(num_classes))` for the Gaussian blur experiment
+  - For the “new class” experiment, training labels will be a subset (we’ll come back to that).
+
+  Example for a no-drift FireRisk baseline: 
+
+  """
+  # baseline: all train data, no drift
+E_train, Y_pred_train, _ = get_embeddings_and_preds(model, train_loader)
+training_label_list = sorted(np.unique(Y_pred_train))
+
+# threshold data: e.g., clean subset of test data
+E_thr, Y_pred_thr, _ = get_embeddings_and_preds(model, test_loader)
+
+from driftlens.driftlens import DriftLens
+dl = DriftLens()
+baseline = dl.estimate_baseline(E_train, Y_pred_train,
+                                label_list=training_label_list,
+                                batch_n_pc=150,
+                                per_label_n_pc=75)
+
+per_batch_sorted, per_label_sorted = dl.random_sampling_threshold_estimation(
+    label_list=training_label_list,
+    E=E_thr,
+    Y=Y_pred_thr,
+    batch_n_pc=150,
+    per_label_n_pc=75,
+    window_size=1000,
+    n_samples=10000,
+    flag_shuffle=True,
+    flag_replacement=True,
+)
+  """
+
+Those hypeparams mirror the README defaults; adjust to match the original STL-10 notebooks once you know what thye used. 
+
+
+  ------------------------------------------------------------
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+  ------------------------------------------------------------
+
+  EXTRA NOTES:
+
+  4. CONNECT FIRERISK EMBEDDINGS TO DRIFTLENS
+
+  1.  Compute baseline: baseline = dl.estimate_baseline(E_train,
+      Y_pred_train, label_list, …)
+
+  2.  Compute thresholds: per_batch_sorted, per_label_sorted =
+      dl.random_sampling_threshold_estimation(…)
+
+  Use clean test data for threshold estimation.
+  ------------------------------------------------------------
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+  ------------------------------------------------------------
+
+
+
+  ------------------------------------------------------------
+  5. FIRERISK ANALOGUE OF EXPERIMENT 7.1 - NEW CLASS DRIFT 
+  ------------------------------------------------------------
+
+  Original 7.1: 
+  Train on STL-10 classes `{airplane, bird, ..., ship}` (9 classes), drift simulated with a *new class* `truck`. 
+
+  For FireRisk, we can do: 
+
+  - Train on 6 of 7 risk levels, e.g. grid_code {1,…,6} = {Very Low, Low, Moderate, High, Very High, Non-burnable}.
+  - Keep class 7 water unseen in training; introduce it only in the online stream as drift.
+
+  You can pick any class as the “new” one, but water is a nice semantically distinct class.
+
+
+  5.1 Create FireRisk datasets without the new class
+
+  Modify `FireRiskDataset` so we can pass `classes_subset`:
+
+  """
+  classes_train = {1, 2, 3, 4, 5, 6}  # grid_codes used in training
+  classes_new = {7}                   # drift-only class
+
+  train_ds_nc = FireRiskDataset("data/FireRisk", split="train",
+                                transform=img_transform,
+                                classes_subset=classes_train)
+  thr_ds_nc   = FireRiskDataset("data/FireRisk", split="test",
+                                transform=img_transform,
+                                classes_subset=classes_train)
+
+  train_loader_nc = DataLoader(train_ds_nc, batch_size=batch_size, shuffle=True, num_workers=4)
+  thr_loader_nc   = DataLoader(thr_ds_nc,   batch_size=batch_size, shuffle=False, num_workers=4)
+
+  """
+
+  Retrain your ViT only on `train_loader_nc` so it never sees class 7.
+
+
+  5.2 Baseline + threhsolds for the "no-new-class" world 
+
+  Same as section 4, but using `_nc` loaders: 
+
+  """
+  E_train_nc, Yp_train_nc, _ = get_embeddings_and_preds(model, train_loader_nc)
+  E_thr_nc,   Yp_thr_nc,   _ = get_embeddings_and_preds(model, thr_loader_nc)
+
+  train_labels_nc = sorted(np.unique(Yp_train_nc))
+
+  dl_nc = DriftLens()
+  baseline_nc = dl_nc.estimate_baseline(E_train_nc, Yp_train_nc,
+                                        label_list=train_labels_nc,
+                                        batch_n_pc=150,
+                                        per_label_n_pc=75)
+
+  per_batch_sorted_nc, per_label_sorted_nc = dl_nc.random_sampling_threshold_estimation(
+      label_list=train_labels_nc,
+      E=E_thr_nc,
+      Y=Yp_thr_nc,
+      batch_n_pc=150,
+      per_label_n_pc=75,
+      window_size=1000,
+      n_samples=10000,
+      flag_shuffle=True,
+      flag_replacement=True,
+  )
+
+  """
+
+  5.3 Build the online stream with a new class appearing
+  You need to construct a sequence of windows:
+  - Pre-drift windows: only classes {1,…,6}
+  - Post-drift windows: mixture including class 7
+  Simple way:
+
+  """
+  from torch.utils.data import Subset
+
+  # test set with *all* classes, no filter
+  test_ds_all = FireRiskDataset("data/FireRisk", split="test", transform=img_transform)
+
+  # indices by class
+  labels_all = test_ds_all.labels  # because we exposed it in dataset
+  indices_by_class = {c: [i for i, y in enumerate(labels_all) if y == c-1] for c in range(1,8)}
+
+  # build stream indices: first only train classes, then inject new class
+  pre_drift_len = 40000
+  post_drift_len = 40000
+  window_size = 1000
+
+  pre_indices = []
+  while len(pre_indices) < pre_drift_len:
+      for c in classes_train:
+          if indices_by_class[c]:
+              pre_indices.append(indices_by_class[c].pop())
+          if len(pre_indices) >= pre_drift_len:
+              break
+
+  post_indices = []
+  while len(post_indices) < post_drift_len:
+      # allow new class plus old ones
+      for c in classes_train | classes_new:
+          if indices_by_class[c]:
+              post_indices.append(indices_by_class[c].pop())
+          if len(post_indices) >= post_drift_len:
+              break
+
+  stream_indices = pre_indices + post_indices
+  stream_ds = Subset(test_ds_all, stream_indices)
+  stream_loader = DataLoader(stream_ds, batch_size=batch_size, shuffle=False, num_workers=4)
+
+  """
+
+  Get embeddings/preds on this stream:
+
+  """
+  E_stream, Yp_stream, _ = get_embeddings_and_preds(model, stream_loader)
+  """
+
+ Now cut into windows and feed DriftLens:
+
+  """
+  n = E_stream.shape[0]
+  n_windows = n // window_size
+
+  window_distances = []
+  for w in range(n_windows):
+      start = w * window_size
+      end = start + window_size
+      Ew = E_stream[start:end]
+      Ypw = Yp_stream[start:end]
+      dist_w = dl_nc.compute_window_distribution_distances(Ew, Ypw)
+      window_distances.append(dist_w)
+  """
+
+Plot window_distances over time; you should see a sharp increase around the first window that includes class 7 (FireRisk water).
+If you want to emulate sudden, incremental, periodic patterns like Fig. 13 in the TKDE paper, you just change how often and how soon the class-7 indices appear in stream_indices.
+
+
+
+
+  ------------------------------------------------------------
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+  ------------------------------------------------------------
+
+  EXTRA NOTES:
+
+
+  new class “truck”. FireRisk version: hold
+  out grid_code 7 (water) as unseen class.
+
+  1. Train model using classes {1…6} only. 2. Compute baseline
+  and thresholds using clean data without class 7. 3. Build
+  online stream: - Pre-drift windows: only classes {1…6} -
+  Post-drift windows: introduce class 7 into windows 4.
+  Compute DriftLens window distances over time. 5. Expect
+  spike when class 7 appears.
+  ------------------------------------------------------------
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+  ------------------------------------------------------------
+
+
+  ----------------------------------------------------------------------------
+  6. FIRERISK ANALOGUE OF EXPERIMENT 8 - GAUSSIAN BLUR DRIFT ON FIRERISK
+  ----------------------------------------------------------------------------
+
+  Original 8: 
+
+  | Train on all 10 STL-10 classes. Drift: inject Gaussaian blur on images of all classes. 
+
+  For FireRisk: 
+  - Trian on all 7 classes (no class held out).
+  - Drift = Gaussian blur applied to every image after some time in the stream. 
+
+  6.1 Train ViT on all FireRisk classes 
+
+  Use the original `train_ds/train_loader` with `classes_sbuset=None`. Train to Convergence. 
+
+  """
+  E_train, Yp_train, _ = get_embeddings_and_preds(model, train_loader)
+  E_thr,   Yp_thr,   _ = get_embeddings_and_preds(model, test_loader)
+  labels_all = sorted(np.unique(Yp_train))
+  """
+
+  Estimate baseline + thresholds as in section 4. 
+
+  6.2 Build clean vs blurred stream 
+
+  The trick is to have two views of the same underlying FireRisk images: 
+  - Clean view: `img_transform`
+  - Blurred view: `img_transform_blue = GussianBlur * img_transform`
+
+  Define a transform with Gaussian blur: 
+
+  """
+  blur_transform = transforms.Compose([
+    transforms.Resize(224),
+    transforms.CenterCrop(224),
+    transforms.GaussianBlur(kernel_size=11, sigma=3.0),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225]),
+])
+  """
+  Use a share underlying dataset of path, but with different transforms: 
+
+  """
+  base_ds_clean = FireRiskDataset("data/FireRisk", split="test",
+                                transform=img_transform)
+  base_ds_blur  = FireRiskDataset("data/FireRisk", split="test",
+                                  transform=blur_transform)
+
+  # Use the same underlying ordering of paths & labels
+  assert base_ds_clean.paths == base_ds_blur.paths
+  assert base_ds_clean.labels == base_ds_blur.labels
+
+  clean_loader = DataLoader(base_ds_clean, batch_size=batch_size, shuffle=False, num_workers=4)
+  blur_loader  = DataLoader(base_ds_blur,  batch_size=batch_size, shuffle=False, num_workers=4)
+
+  """
+
+  Let's say you want 50% clean windws then 50% blurred windows: 
+
+  """
+  E_clean, Yp_clean, _ = get_embeddings_and_preds(model, clean_loader)
+  E_blur,  Yp_blur,  _ = get_embeddings_and_preds(model, blur_loader)
+
+  # Sanity: labels should match, but predictions may slightly differ due to blur
+  assert (Yp_clean.shape == Yp_blur.shape)
+  """
+
+  Construct the stream: 
+  """
+  window_size = 1000
+  n_clean = 40000
+  n_blur = 40000
+
+  E_stream2 = np.concatenate([E_clean[:n_clean], E_blur[:n_blur]], axis=0)
+  Yp_stream2 = np.concatenate([Yp_clean[:n_clean], Yp_blur[:n_blur]], axis=0)
+  """
+
+  Compute window distances: 
+  """
+  n2 = E_stream2.shape[0]
+  n_windows2 = n2 // window_size
+
+  window_distances2 = []
+  for w in range(n_windows2):
+      s = w * window_size
+      e = s + window_size
+      Ew = E_stream2[s:e]
+      Ypw = Yp_stream2[s:e]
+      dist_w = dl.compute_window_distribution_distances(Ew, Ypw)
+      window_distances2.append(dist_w)
+
+  """
+
+  Plot `window_distances2` vs window index. You should see a shift in distances when the blur kicks in, 
+  similar to the STL-10 ViT 8.x experiment. 
+
+  You can also create: 
+  - Sudden blur: all windows after a time index are blurred. 
+  - Incremental blur: gradually increasesign or mix more blurred images per window. 
+  - Periodic blur: alternate clean/blurred segments. 
+
+  This mimics the drift patterns explred in the paper's qualitive figures. 
+
+
+  ----------------------------------------------------------------------------
+  7. WHERE TO MODIFY THE EXISTING DRIFTRLENS EXPERIMENTS 
+  ----------------------------------------------------------------------------
+
+  Because we can't see the `experiments` directory here, treat your changes as: 
+  1. Locate the STL-10 ViT notebooks under `drift-l;ens/experiments/`.
+    - There shuld be something corresponding to "use case 7.x" with STL-10 + ViT. 
+  2. In those notebooks/scripts, look for the following blocks and *swap them out*:
+    (a) Dataset creation block 
+    - Currently: something like `torchvision.datasets.STL10(...)
+    - Replace with the `FireRishDataset` + transforms form 2, and adjust the label list to 7 classes 
+    (or 6 when doing the new-class experiment).
+
+    (b) Model definition: 
+    - They proably define a ViT backbone (maybe via timm, maybe custom).
+    - Keep the architecture/hyperparams, but change `num_classes` from 10 to 7 (or 6). 
+    - Ensure you expose a way to get embedding (features) separately form logits. 
+      If they already have a helper that returns embeddings, re0use that-just feed FireRisk through it. 
+
+    (c) Stream construction: 
+    - STL-10 code will assemble sequences of inces for training, threshold, and stream, and then cut those into windows for DriftLens. 
+    - Replace the STL-10 splits with the FireRisk splits as in 5-6. 
+      - For 7.1: filter training/thr 
+
+    (d) Label list / hyperparams 
+    - Wherever they compute `label_list`, make it `sorted(np.uniqwue(Y_pred_train)) for your FireRisk case. 
+    - Keep the same `window_size`, `batch_n_pc`, `per_label_n_pc`, `n_samples`, etc., unless you have a reason to change them.
+      That preserves comparability to the STL-10 setup. 
+    3. Outputs/plots
+    - Any plots of "DriftLens distance over time" will now be FireRisk-base; you don't need to change plotting code - just ensure you pass the new `window_distances` arrays. 
