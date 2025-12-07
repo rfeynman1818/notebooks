@@ -3,10 +3,19 @@ import os
 import numpy as np
 import sys
 
-# ... (FILE_CONFIG and EMBEDDING_DIM remain the same) ...
+# --- CONFIGURATION ---
+# Expected number of samples (based on 10000/10000 split)
+FILE_CONFIG = {
+    "baseline.hdf5": 10000,     
+    "threshold.hdf5": 10000,    
+    "datastream.hdf5": None     # Expected size depends on dataset, check will only verify columns
+}
+# ResNet50 with classification layer removed outputs a 2048-dimensional vector.
+EMBEDDING_DIM = 2048
+# -----------------------------------
 
-def verify_hdf5_file_with_found_keys(filepath, expected_samples=None):
-    """Opens an HDF5 file and verifies its structure using the keys found in the error log."""
+def verify_hdf5_file(filepath, expected_samples=None):
+    """Opens an HDF5 file and verifies its structure and contents using the actual keys found in your files."""
     
     print(f"\n--- Checking {filepath} ---")
     
@@ -14,13 +23,19 @@ def verify_hdf5_file_with_found_keys(filepath, expected_samples=None):
         print(f"❌ ERROR: File not found at '{filepath}'.")
         return False
 
-    # Use the keys found in the error traceback (182.png)
+    # --- DYNAMIC KEY SELECTION ---
+    # Based on the error log (182.png), the keys saved are non-standard.
     EMBEDDING_KEY = 'E'
-    LABEL_KEY = 'Y_predicted' if 'datastream' in filepath or 'threshold' in filepath else 'Y'
+    # Use 'Y_predicted' for threshold/datastream, and 'Y' for baseline
+    if 'baseline' in filepath:
+        LABEL_KEY = 'Y'
+    else:
+        LABEL_KEY = 'Y_predicted'
+    # -----------------------------
 
     try:
         with h5py.File(filepath, 'r') as f:
-            # 1. Check for expected datasets
+            # 1. Check for expected datasets (using the actual keys found)
             if EMBEDDING_KEY not in f or LABEL_KEY not in f:
                 print(f"❌ ERROR: Missing required datasets. Expected '{EMBEDDING_KEY}' and '{LABEL_KEY}'.")
                 print(f"   Found keys: {list(f.keys())}")
@@ -29,13 +44,13 @@ def verify_hdf5_file_with_found_keys(filepath, expected_samples=None):
             E = f[EMBEDDING_KEY]
             Y = f[LABEL_KEY]
             
-            # ... (Rest of the shape and type checks are the same) ...
+            # 2. Check shapes
             E_shape = E.shape
             Y_shape = Y.shape
             
-            # Check the number of samples
+            # Check the number of samples (only warn if it's not the datastream)
             if expected_samples is not None and E_shape[0] != expected_samples and 'datastream' not in filepath:
-                print(f"⚠️ WARNING: Expected {expected_samples} samples, but found {E_shape[0]} samples.")
+                print(f"⚠️ WARNING: Expected {expected_samples} samples, but found {E_shape[0]} samples in {filepath}.")
             
             # Check the feature dimension
             if len(E_shape) != 2 or E_shape[1] != EMBEDDING_DIM:
@@ -47,7 +62,7 @@ def verify_hdf5_file_with_found_keys(filepath, expected_samples=None):
                 print(f"❌ ERROR: '{LABEL_KEY}' shape is incorrect. Expected ({E_shape[0]},), got {Y_shape}.")
                 return False
             
-            # Check data types
+            # 3. Check data types
             if E.dtype not in [np.float32, np.float64]:
                 print(f"⚠️ WARNING: '{EMBEDDING_KEY}' data type is unusual. Expected float, got {E.dtype}.")
 
@@ -62,5 +77,15 @@ def verify_hdf5_file_with_found_keys(filepath, expected_samples=None):
     except Exception as e:
         print(f"❌ CRITICAL ERROR: Could not read file due to an exception: {e}")
         return False
-        
-# ... (Call the verification function with the appropriate name) ...
+
+# --- Run Verification ---
+if __name__ == "__main__":
+    all_ok = True
+    for filename, expected_samples in FILE_CONFIG.items():
+        if not verify_hdf5_file(filename, expected_samples):
+            all_ok = False
+
+    if all_ok:
+        print("\n\nAll HDF5 files passed the basic verification checks! 🎉")
+    else:
+        print("\n\nOne or more HDF5 files failed the verification checks. 🛑")
